@@ -1,0 +1,15 @@
+{
+  "id": "style-5",
+  "name": "타이포그래피형 · 차분하고 고급스러운 (1105 15:48)",
+  "description": "스타일 바꿔 보기로 만든 조합",
+  "layout": "typo",
+  "radius": 4,
+  "box_style": "outlined",
+  "show_numbers": true,
+  "illustration_height": 440,
+  "colors": {},
+  "style_prompt": "",
+  "heading_font": "notoserifkr",
+  "body_font": "gowunbatang",
+  "image_aspect": "4:5"
+}

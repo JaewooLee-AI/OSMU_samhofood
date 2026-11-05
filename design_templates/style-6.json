@@ -1,0 +1,15 @@
+{
+  "id": "style-6",
+  "name": "색 배경 일정표형 · 강렬하고 눈에 띄는 (1105 15:53)",
+  "description": "스타일 바꿔 보기로 만든 조합",
+  "layout": "color_block",
+  "radius": 8,
+  "box_style": "filled",
+  "show_numbers": true,
+  "illustration_height": 440,
+  "colors": {},
+  "style_prompt": "Warm flat vector landscape illustration, autumn palette of orange, mustard and cream, simple rounded shapes, cozy and festive mood.",
+  "heading_font": "blackhansans",
+  "body_font": "pretendard",
+  "image_aspect": "16:9"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "style",
+  "name": "타이포그래피형 · 편안한 자연 느낌 (1103 10:47)",
+  "description": "스타일 바꿔 보기로 만든 조합",
+  "layout": "typo",
+  "radius": 24,
+  "box_style": "filled",
+  "show_numbers": true,
+  "illustration_height": 440,
+  "colors": {},
+  "style_prompt": "",
+  "heading_font": "gowunbatang",
+  "body_font": "nanumhuman",
+  "image_aspect": "4:5"
+}

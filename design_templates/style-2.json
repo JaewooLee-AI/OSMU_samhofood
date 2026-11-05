@@ -1,0 +1,15 @@
+{
+  "id": "style-2",
+  "name": "공공 안내형 · 강렬하고 눈에 띄는 (1103 10:48)",
+  "description": "스타일 바꿔 보기로 만든 조합",
+  "layout": "gov",
+  "radius": 40,
+  "box_style": "filled",
+  "show_numbers": true,
+  "illustration_height": 440,
+  "colors": {},
+  "style_prompt": "",
+  "heading_font": "blackhansans",
+  "body_font": "pretendard",
+  "image_aspect": "4:5"
+}

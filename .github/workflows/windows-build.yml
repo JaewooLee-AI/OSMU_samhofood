@@ -1,0 +1,247 @@
+name: windows-build
+
+# 삼호푸드 OSMU 스튜디오 Flet 데스크톱 앱의 Windows 설치 파일(setup.exe)을 빌드한다.
+# (OSMU_cjc의 flet-windows-build.yml과 같은 방식)
+#
+# - `flet build`는 앱 경로 루트에 main.py가 있어야 하므로, 필요한 파일만 stage/에 복사해 그곳을 빌드한다.
+# - 쇼츠 영상에 필요한 ffmpeg/ffprobe는 빌드 뒤 exe 옆 ffmpeg/ 폴더에 넣어 설치 프로그램에 함께 묶는다
+#   (services/paths.py가 시작할 때 그 폴더를 PATH에 추가).
+# - main 브랜치에 push하면 GitHub Release가 자동 게시된다. 다른 브랜치는 Actions 아티팩트만 만든다.
+# - 사용자 데이터는 %APPDATA%\SamhoFood_OSMU 에 있어 설치·재설치·제거로 지워지지 않는다.
+
+on:
+  push:
+    paths:
+      - "main.py"
+      - "ui_extra.py"
+      - "services/**"
+      - "models/**"
+      - "templates/**"
+      - "presets/**"
+      - "compliance_packs/**"
+      - "design_templates/**"
+      - "assets/**"
+      - "pyproject.toml"
+      - "installer/**"
+      - ".github/workflows/windows-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  FLET_CLI_NO_RICH_OUTPUT: "1"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        # flet·flet-cli·flet-desktop은 같은 버전으로 맞춘다 (올릴 때 PyPI에 셋 다 올라왔는지 확인).
+        run: |
+          python -m pip install --upgrade pip
+          pip install flet==1.0.4 flet-cli==1.0.4 flet-desktop==1.0.4 google-genai anthropic pydantic `
+            Pillow Jinja2 gTTS qrcode playwright pyperclip pywin32
+
+      - name: Check Playwright can launch Chrome via services.naver_publish.launch_browser()
+        # 네이버 게시/로그인에 쓰는 함수가 이 러너의 Chrome에서 실제로 뜨는지 exe 빌드 전에 확인한다.
+        shell: bash
+        run: |
+          python - <<'PYEOF'
+          import sys
+          sys.path.insert(0, ".")
+          from services.naver_publish import launch_browser
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              browser = launch_browser(p, headless=False)
+              page = browser.new_page()
+              page.set_content("<title>diag-ok</title>")
+              title = page.title()
+              browser.close()
+          assert title == "diag-ok", f"unexpected title: {title!r}"
+          print("Playwright Chrome launch OK")
+          PYEOF
+
+      - name: Smoke test - import the app and load brand kits
+        shell: bash
+        env:
+          OSMU_DATA_DIR: ${{ runner.temp }}/osmu-data
+          OSMU_PROJECTS_DIR: ${{ runner.temp }}/osmu-projects
+        run: |
+          python - <<'PYEOF'
+          import sys, asyncio
+          sys.path.insert(0, ".")
+          import main, ui_extra  # noqa: F401  (임포트 오류를 빌드 전에 잡는다)
+          from services import brand_kit as bk, compliance
+          kits = {k.id for k in bk.list_kits()}
+          assert {"samhofood", "samsami"} <= kits, kits
+          assert compliance.load_pack("food_seafood").id == "food_seafood"
+          print("import + brand kits OK")
+          PYEOF
+
+      - name: Stage app for flet build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path stage | Out-Null
+          Copy-Item -Path main.py, ui_extra.py, pyproject.toml -Destination stage
+          Copy-Item -Recurse -Path services, models, templates, presets, compliance_packs, design_templates, assets -Destination stage
+          Get-ChildItem -Recurse stage -Include __pycache__ -Directory | Remove-Item -Recurse -Force
+          Write-Host "----- stage/ -----"
+          Get-ChildItem stage | Format-Table Name -AutoSize
+
+      - name: flet build windows
+        run: flet build windows stage --yes --verbose
+
+      - name: Inspect build (exe name, app folder, version)
+        id: meta
+        shell: pwsh
+        run: |
+          $out = "stage/build/windows"
+          $exes = @(Get-ChildItem $out -Filter *.exe -File)
+          if ($exes.Count -ne 1) { throw "stage/build/windows에 실행 파일이 1개가 아닙니다: $($exes.Name -join ', ')" }
+          if (-not (Test-Path "$out/app")) { throw "app 폴더가 없습니다 — 빌드 구조가 바뀌었는지 확인하세요." }
+          Get-ChildItem $out | Select-Object Name | Format-Table -AutoSize
+          $version = "0.1.${{ github.run_number }}"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "exe=$($exes[0].Name)" >> $env:GITHUB_OUTPUT
+          Write-Host "version=$version exe=$($exes[0].Name)"
+
+      - name: Bundle ffmpeg + ffprobe next to the exe
+        # 쇼츠 영상 인코딩에 필요. gyan.dev 'essentials' 빌드(GPL, libx264 포함)를 내려받아 exe 옆 ffmpeg/ 에 둔다.
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $bin = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $bin) { throw "ffmpeg.exe를 찾지 못했습니다" }
+          $dest = "stage/build/windows/ffmpeg"
+          New-Item -ItemType Directory -Path $dest | Out-Null
+          Copy-Item $bin.FullName $dest
+          Copy-Item (Join-Path $bin.DirectoryName "ffprobe.exe") $dest
+          & "$dest/ffmpeg.exe" -version | Select-Object -First 1
+
+      - name: Make installer icon (.ico) from assets/icon.png
+        run: python -c "from PIL import Image; Image.open('assets/icon.png').save('installer/osmu-samhofood.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup 설치 실패" }
+          }
+          $ko = Test-Path (Join-Path (Split-Path $iscc) 'Languages\Korean.isl')
+          Write-Host "설치 화면 언어: $(if ($ko) { '한국어' } else { '영어 (Korean.isl 없음)' })"
+          & $iscc "/DAppVersion=${{ steps.meta.outputs.version }}" "/DAppExe=${{ steps.meta.outputs.exe }}" `
+            "/DSourceDir=$PWD\stage\build\windows" "/DOutputDir=$PWD\dist" "/DIconFile=$PWD\installer\osmu-samhofood.ico" `
+            installer\osmu-samhofood.iss
+          if ($LASTEXITCODE -ne 0) { throw "설치 프로그램 만들기 실패 (ISCC exit $LASTEXITCODE)" }
+
+      - name: Test install, reinstall, uninstall
+        # 러너에서 앱 창은 띄울 수 없으므로(이전에 확인됨) 설치 프로그램 동작만 시험한다:
+        # Program Files 설치·바탕화면 아이콘 → 재설치 때 옛 파일 정리·아이콘/제거 항목 1개 → 제거.
+        # 사용자 데이터 폴더(%APPDATA%\SamhoFood_OSMU)는 세 단계 모두에서 그대로 남아야 한다.
+        shell: pwsh
+        run: |
+          $setup = "dist\OSMU-Samhofood-Setup-${{ steps.meta.outputs.version }}.exe"
+          $dir = "$env:ProgramFiles\OSMU Samhofood"
+          $exe = Join-Path $dir "${{ steps.meta.outputs.exe }}"
+          $desktop = "$env:PUBLIC\Desktop"
+          $userData = Join-Path $env:APPDATA 'SamhoFood_OSMU'
+          $marker = Join-Path $userData 'installer-test-marker.txt'
+          function Run-Setup($path, $log) {
+            $p = Start-Process $path -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$log" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 40; throw "$path 실패 (exit $($p.ExitCode))" }
+          }
+          function Desktop-Links { @(Get-ChildItem $desktop -Filter *.lnk -ErrorAction SilentlyContinue) }
+          function Check-UserData($when) { if (-not (Test-Path $marker)) { throw "$when 뒤 사용자 데이터 폴더가 지워졌습니다: $userData" } }
+
+          New-Item -ItemType File -Path $marker -Force | Out-Null
+
+          # 1) 처음 설치: Program Files에 실행 파일, 바탕화면에 아이콘
+          $before = (Desktop-Links).Count
+          Run-Setup $setup "$PWD\install1.log"
+          if (-not (Test-Path $exe)) { throw "1차 설치 후 실행 파일이 없습니다: $exe" }
+          if ((Desktop-Links).Count -ne $before + 1) { throw "바탕화면 아이콘이 만들어지지 않았습니다" }
+          Check-UserData '1차 설치'
+          Write-Host "1차 설치 OK: $exe"
+
+          # 2) 재설치(업데이트): 옛 버전 파일이 남지 않고, 아이콘·제거 항목이 중복되지 않아야 한다
+          $stale = @(
+            (Join-Path $dir 'site-packages\old_removed_pkg\__init__.pyc'),
+            (Join-Path $dir 'app\old_removed_module.py'),
+            (Join-Path $dir 'old_removed.dll')
+          )
+          foreach ($f in $stale) { New-Item -ItemType File -Path $f -Force | Out-Null }
+          Run-Setup $setup "$PWD\install2.log"
+          if (-not (Test-Path $exe)) { throw "재설치 후 실행 파일이 없습니다" }
+          foreach ($f in $stale) { if (Test-Path $f) { throw "재설치 때 이전 버전 파일이 남았습니다: $f" } }
+          if (-not (Test-Path (Join-Path $dir 'unins000.exe'))) { throw "재설치 후 제거 프로그램이 없습니다" }
+          if ((Desktop-Links).Count -ne $before + 1) { throw "재설치 후 바탕화면 아이콘 수가 맞지 않습니다" }
+          $entries = @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' |
+            Where-Object { $_.PSChildName -like '*2A9601EB-6387-4F04-AD35-E51B218E4FBE*' })
+          if ($entries.Count -ne 1) { throw "'설치된 앱' 목록 항목이 1개가 아닙니다: $($entries.Count)" }
+          Check-UserData '재설치'
+          Write-Host "재설치 OK (옛 파일 정리, 아이콘·제거 항목 1개, 사용자 데이터 유지)"
+
+          # 3) 제거: 설치 폴더와 바탕화면 아이콘은 사라지고, 사용자 데이터는 남아야 한다
+          Run-Setup (Join-Path $dir 'unins000.exe') "$PWD\uninstall.log"
+          for ($i = 0; $i -lt 30 -and (Test-Path $dir); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path $dir) { throw "제거 후 설치 폴더가 남았습니다" }
+          if ((Desktop-Links).Count -ne $before) { throw "제거 후 바탕화면 아이콘이 남았습니다" }
+          Check-UserData '제거'
+          Write-Host "제거 OK (사용자 데이터 유지)"
+
+      - name: Zip installer
+        # 카카오톡 등으로 .exe를 직접 보내면 막히거나 경고가 붙으므로 setup.exe 하나를 zip으로 감싼다.
+        shell: pwsh
+        run: |
+          $name = "OSMU-Samhofood-Setup-${{ steps.meta.outputs.version }}"
+          Compress-Archive -Path "dist\$name.exe" -DestinationPath "$name.zip"
+          "SETUP_ZIP=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: osmu-samhofood-setup
+          path: OSMU-Samhofood-Setup-*.zip
+          if-no-files-found: error
+
+      - name: Upload build folder artifact (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: osmu-samhofood-windows-build
+          path: stage/build/windows
+          if-no-files-found: warn
+
+      # --- 자동 배포 ---------------------------------------------------------
+      # main에 푸시될 때마다 setup.exe를 담은 zip 하나를 GitHub Releases에 올린다.
+      # Actions 아티팩트는 로그인해야 받을 수 있고 90일 뒤 사라지지만, 릴리스는 저장소의
+      # Releases 페이지에서 누구나 바로 내려받을 수 있다. 담당자는 항상
+      # https://github.com/<owner>/<repo>/releases/latest 에서 받으면 된다.
+      - name: Publish GitHub Release
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="v${{ steps.meta.outputs.version }}"
+          gh release create "$VERSION" "$SETUP_ZIP" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "삼호푸드 OSMU 스튜디오 $VERSION" \
+            --notes "커밋 ${GITHUB_SHA::7} 자동 빌드. zip을 풀고 안의 OSMU-Samhofood-Setup-….exe를 실행하면 설치됩니다(C:\Program Files\OSMU Samhofood, 바탕화면·시작 메뉴 아이콘 생성). 이전 버전이 있으면 같은 자리에 업데이트되고, 설정·사용량 기록·네이버 로그인 세션은 그대로 남습니다. 처음 설치한 PC는 [설정]에서 Gemini 또는 Claude API 키를 등록하고, 네이버 게시를 쓰려면 Chrome이 설치되어 있어야 합니다. 서명되지 않은 설치 파일이라 Windows SmartScreen 경고가 나오면 '추가 정보 → 실행'을 누르세요." \
+            --latest
