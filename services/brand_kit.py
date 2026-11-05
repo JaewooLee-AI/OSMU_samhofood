@@ -83,6 +83,9 @@ class AppSettings(BaseModel):
     planning_model: str = "auto"           # 원고·시나리오·쇼츠 대본 Gemini 모델 (auto = GEMINI_MODEL 기본값)
     image_model: str = "auto"              # AI 이미지 모델 (auto = 기본 순서로 시도)
     reviewer_name: str = ""                # 카드 확정 시 마지막으로 입력한 담당자 이름
+    blog_template: str = "basic"           # 블로그 서식 스타일: basic | info | review
+    blog_strength: str = "standard"        # 서식 강도: none | minimal | standard | rich
+    naver_format_mode: str = "editor"      # 네이버 붙여넣기: editor(에디터 서식 우선) | symbol(기호로 대체)
     naver_blog_id: str = ""                # 네이버 게시용 블로그 아이디 (blog.naver.com/<아이디>)
 
 

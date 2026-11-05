@@ -11,12 +11,12 @@ import re
 import base64
 import asyncio
 import logging
-from html import escape
 from typing import Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from services import brand_kit as bk
 from services import compliance
+from services import formatting
 from services import usage_log
 from models.schema import MediaAsset
 
@@ -54,6 +54,8 @@ class BlogRequest(BaseModel):
     news: str = ""            # 이번 주 소식·프로모션·나눔 이야기
     memo: str = ""            # 자유 메모 (선택)
     length: str = "보통"      # 짧게 | 보통 | 길게
+    template: str = "basic"   # 서식 스타일: basic | info | review (services/formatting.py)
+    strength: str = "standard"  # 서식 강도: none | minimal | standard | rich
     provider: str = "gemini"  # gemini | claude
     assets: List[MediaAsset] = Field(default_factory=list)
 
@@ -73,6 +75,7 @@ def _prompt(req: BlogRequest, kit: bk.BrandKit, pack) -> str:
                   + ", ".join(a.id for a in req.assets))
     else:
         photos = "\n[첨부 사진] 없음 — '[사진:...]' 표시를 넣지 마세요."
+    fmt_rules = _format_rules(req)
     return f"""네이버 블로그 글을 한 편 써 주세요.
 
 [브랜드]
@@ -96,10 +99,20 @@ def _prompt(req: BlogRequest, kit: bk.BrandKit, pack) -> str:
 - 제목은 타깃이 검색할 만한 키워드를 자연스럽게 넣을 것
 - 해시태그 후보: {' '.join(kit.default_hashtags)}
 
+{fmt_rules}
 [지킬 규칙]
 - 입력과 사실 목록에 없는 수치·인증·효능·가격·순위를 만들지 말 것
 {compliance.prompt_rules(pack, kit)}
 """
+
+
+def _format_rules(req: BlogRequest) -> str:
+    """OSMU_cjc의 원고 서식 지시(소제목·굵게·형광·인용구·구분선·요약 박스)를 이 앱의 사진 표시([사진:ID])에 맞게 넣는다"""
+    text = formatting.instruction(req.template, req.strength, bool(req.assets))
+    if not text:
+        return "[원고 서식]\n- 소제목만 '## 소제목'으로 쓰고 다른 서식 표시는 쓰지 마세요.\n"
+    lines = [ln for ln in text.splitlines() if "[사진 설명" not in ln and "[사진 제안" not in ln]
+    return "\n".join(lines).replace("[IMAGE: …]", "[사진:ID]") + "\n"
 
 
 def _system(kit: bk.BrandKit) -> str:
@@ -250,6 +263,7 @@ def apply_rules(text: str, kit: bk.BrandKit, pack) -> Tuple[str, List[str]]:
 def review(text: str, kit: bk.BrandKit) -> List[str]:
     """게시 전에 사람이 확인할 표현 (경고만, 자동 수정 없음)"""
     pack = compliance.load_pack(kit.industry_pack)
+    text = formatting.extract(text)[0]
     out = []
     for wp in pack.warn_patterns:
         hits = sorted({m.group(0).strip() for m in re.finditer(wp.pattern, text)})
@@ -292,41 +306,69 @@ def arrange_images(body: str, mode: str, photo_ids: List[str], card_count: int) 
     return "\n\n".join(blocks)
 
 
-def to_segments(title: str, body: str, hashtags: List[str], photos: Dict[str, str], cards: List[str]) -> List[Tuple[str, str]]:
-    """평문 원고 → [("html", ...), ("image", 경로)] 문서 순서 목록 (네이버 붙여넣기용)"""
-    segs: List[Tuple[str, str]] = []
-    html: List[str] = []
-
-    def flush():
-        if html:
-            segs.append(("html", "".join(html)))
-            html.clear()
-
+def _tagged(body: str, hashtags: List[str]) -> str:
+    """평문 원고 → cjc 서식 모듈이 읽는 형태: 이미지는 [IMAGE: 키] (사진 A1, 카드 C1) 한 줄, 문단은 한 줄씩"""
+    lines = []
     for block in _blocks(body):
         pm, cm = PHOTO_RE.match(block), CARD_RE.match(block)
-        if pm or cm:
-            path = photos.get(pm.group(1)) if pm else (cards[int(cm.group(1)) - 1] if 0 < int(cm.group(1)) <= len(cards) else None)
-            if path:
-                flush()
-                segs.append(("image", path))
-            continue
-        hm = HEADING_RE.match(block)
-        if hm:
-            html.append(f"<p><b>{escape(hm.group(1))}</b></p><p><br></p>")
+        if pm:
+            lines.append(f"[IMAGE: {pm.group(1)}]")
+        elif cm:
+            lines.append(f"[IMAGE: C{cm.group(1)}]")
         else:
-            html.append("".join(f"<p>{escape(line)}</p>" for line in block.splitlines() if line.strip()) + "<p><br></p>")
+            lines.extend(ln for ln in block.splitlines() if ln.strip())
     if hashtags:
-        html.append(f"<p>{escape(' '.join(hashtags))}</p>")
-    flush()
-    return segs
+        lines.append(" ".join(hashtags))
+    return "\n".join(lines)
+
+
+def build_format(body: str, hashtags: List[str], template: str, strength: str) -> Tuple[str, dict]:
+    """서식 표시가 든 원고 → (평문, 서식 JSON). 평문 안에는 서식 기호가 남지 않는다."""
+    plain, items = formatting.extract(_tagged(body, hashtags))
+    return plain, formatting.finalize(plain, items, strength, template, source="blog")
+
+
+def to_segments(title: str, body: str, hashtags: List[str], photos: Dict[str, str], cards: List[str],
+                template: str = "basic", strength: str = "standard",
+                mode: str = formatting.DEFAULT_NAVER_FORMAT_MODE) -> Tuple[List[Tuple[str, str]], dict]:
+    """원고 → ([("html", ...), ("image", 경로)] 붙여넣기 순서, 에디터에 생겨야 할 서식 수)"""
+    plain, fmt = build_format(body, hashtags, template, strength)
+    segs: List[Tuple[str, str]] = []
+    for kind, value in formatting.naver_segments(plain, fmt, mode):
+        if kind == "image":
+            path = cards[int(value[1:]) - 1] if re.fullmatch(r"C\d+", value) and 0 < int(value[1:]) <= len(cards) else photos.get(value)
+            if path:
+                segs.append(("image", path))
+        else:
+            segs.append((kind, value))
+    return segs, formatting.expected_components(plain, fmt)
 
 
 def plain_text(body: str) -> str:
-    """카드뉴스·쇼츠 기획에 넘길 원문 (이미지 표시·소제목 기호 제거)"""
-    out = []
-    for b in _blocks(body):
-        if PHOTO_RE.match(b) or CARD_RE.match(b):
-            continue
-        hm = HEADING_RE.match(b)
-        out.append(hm.group(1) + "." if hm else b)
+    """카드뉴스·쇼츠 기획에 넘길 원문 (서식 기호·이미지 표시 제거, 소제목은 문장으로)"""
+    plain, _ = formatting.extract(_tagged(body, []))
+    return "\n".join(ln for ln in plain.splitlines() if ln.strip() and not ln.startswith("[IMAGE:"))
+
+
+def preview_markdown(body: str, photos: Dict[str, str]) -> str:
+    """편집 화면의 서식 미리보기용 마크다운 (네이버 결과와 완전히 같지는 않음: 형광은 굵게로 보임)"""
+    out, in_box = [], False
+    for raw in (body or "").splitlines():
+        s = raw.strip()
+        pm, cm = PHOTO_RE.match(s), CARD_RE.match(s)
+        if pm:
+            out.append(f"> 🖼️ **사진 {pm.group(1)}** — {photos.get(pm.group(1), '').rsplit('/', 1)[-1]}")
+        elif cm:
+            out.append(f"> 🖼️ **카드뉴스 {cm.group(1)}번 이미지**")
+        elif formatting._BOX_OPEN_RE.match(s):
+            in_box = True
+            out.append("> 📌 **핵심 정리**")
+        elif formatting._BOX_CLOSE_RE.match(s):
+            in_box = False
+        elif formatting._DIVIDER_RE.match(s):
+            out.append("---")
+        else:
+            s = re.sub(r"==(.+?)==", r"**\1**", s)
+            out.append(("> " + s) if in_box and s else s)
+        out.append("")
     return "\n".join(out)

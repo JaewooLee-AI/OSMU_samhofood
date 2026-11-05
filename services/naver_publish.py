@@ -175,6 +175,47 @@ def _find_published_url(context, blog_id: str) -> Optional[str]:
     return None
 
 
+# 붙여 넣은 뒤 에디터 안에 생긴 서식 요소를 세는 선택자. 스마트에디터 ONE의 구성 요소 클래스
+# 이름이라 네이버가 바꾸면 0으로 셀 수 있습니다 — 그래서 결과는 '경고'가 아니라 '확인 안내'로만 씁니다.
+_COMPONENT_SELECTORS = {
+    "quote": ".se-component.se-quotation, .se-quotation",
+    "divider": ".se-component.se-horizontalLine, .se-horizontalLine",
+    "box": ".se-component.se-table, .se-table",
+}
+
+
+def _count_components(editor_frame, kind: str) -> Optional[int]:
+    try:
+        return len(editor_frame.query_selector_all(_COMPONENT_SELECTORS[kind]))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_warnings(editor_frame, expected: dict, mode: str) -> list:
+    """서식이 에디터에 어떻게 들어갔는지 담당자에게 알릴 문장들."""
+    notes = []
+    if expected.get("hint"):
+        notes.append(f"📷 '사진 자리' 안내 줄 {expected['hint']}개가 본문에 들어갔습니다. 발행 전에 사진을 넣고 그 줄을 지워주세요.")
+    if mode != "editor":
+        return notes
+    labels = {"quote": "인용구", "divider": "구분선", "box": "요약 박스(표)"}
+    missing = []
+    for kind, label in labels.items():
+        want = expected.get(kind) or 0
+        if not want:
+            continue
+        got = _count_components(editor_frame, kind)
+        if got is not None and got < want:
+            missing.append(f"{label} {want}개 중 {got}개")
+    if missing:
+        notes.append(
+            "🎨 에디터 서식으로 바뀐 것을 확인하지 못했습니다: " + ", ".join(missing)
+            + ". 글자로 들어갔을 수 있으니 Chrome 창에서 확인해 주세요. 계속 그렇다면 [설정]의 '네이버 서식 붙여넣기'를 '기호로 대체'로 바꾸면 ❝ ❞ · ──── 같은 기호 줄로 들어갑니다. "
+            "인용구·구분선 모양(따옴표형·선형 등)은 에디터에서 한 번 눌러 바꿀 수 있습니다."
+        )
+    return notes
+
+
 def _human_delay(lo: float = _HUMAN_DELAY[0], hi: float = _HUMAN_DELAY[1]) -> None:
     import random
 
@@ -537,7 +578,8 @@ _PASTE_LOCK = threading.Lock()
 
 
 def publish(blog_id: str, title: str, segments: List[Tuple[str, str]],
-            on_status: Optional[Callable[[str], None]] = None) -> bool:
+            on_status: Optional[Callable[[str], None]] = None, expected: Optional[dict] = None,
+            mode: str = "editor") -> bool:
     """제목·본문 조각을 새 스마트에디터 창에 붙여넣고, 사용자가 창을 닫을 때까지 기다립니다.
 
     segments: [("html", "<p>...</p>"), ("image", "/절대/경로.jpg"), ...] — 문서 순서대로.
@@ -550,14 +592,15 @@ def publish(blog_id: str, title: str, segments: List[Tuple[str, str]],
             return False
         _IN_FLIGHT.add(blog_id)
     try:
-        _run(blog_id, title, segments, on_status)
+        _run(blog_id, title, segments, on_status, expected or {}, mode)
     finally:
         with _IN_FLIGHT_LOCK:
             _IN_FLIGHT.discard(blog_id)
     return True
 
 
-def _run(blog_id: str, title: str, segments: List[Tuple[str, str]], on_status: Callable[[str], None]) -> None:
+def _run(blog_id: str, title: str, segments: List[Tuple[str, str]], on_status: Callable[[str], None],
+         expected: dict, mode: str) -> None:
     from playwright.sync_api import sync_playwright
 
     blog_id = (blog_id or "").strip()
@@ -676,6 +719,7 @@ def _run(blog_id: str, title: str, segments: List[Tuple[str, str]], on_status: C
                                     + ", ".join(Path(v).name for v in failed_photos))
                 if not title_ok:
                     warnings.append("제목을 자동으로 입력하지 못했습니다. Chrome 창에서 직접 확인해 주세요.")
+                warnings += _format_warnings(editor_frame, expected, mode)
                 if warnings:
                     on_status("⚠️ 붙여넣기는 끝났지만 확인이 필요합니다 — " + " / ".join(warnings))
                 else:

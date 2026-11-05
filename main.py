@@ -26,6 +26,7 @@ from services.media_assets import MediaLibrary
 from services.image_generator import AIImageGenerator
 from services import shorts_from_cards
 from services import naver_publish
+from services import formatting
 from services.paths import IS_PACKAGED, ASSETS_DIR, FONTS_DIR, EXPORTS_DIR, UPLOAD_DIR, LOG_DIR
 from ui_extra import SettingsView, CostView, card, h, note, NAVY, AMBER, MUTED
 
@@ -38,6 +39,21 @@ TARGETS = ["(고르지 않음)", "육아·맞벌이 가정", "캠핑·아웃도�
            "외식업·생선구이 전문점 사장님", "공공기관·가치소비자 (ESG)"]
 STEPS = ["알릴 내용", "블로그 글", "카드뉴스", "쇼츠", "네이버 게시"]
 IMG_EXT = ["jpg", "jpeg", "png", "webp", "heic", "gif"]
+
+
+WEB_MODE = os.environ.get("FLET_VIEW", "app").lower() == "web" and not IS_PACKAGED
+
+
+def img_src(path: str) -> str:
+    """이미지 주소 — 데스크톱은 파일 경로 그대로, 웹(localhost)은 서버가 내주는 /projects·/exports 주소"""
+    if not WEB_MODE or not path:
+        return path
+    from urllib.parse import quote
+    for root, prefix in ((ps.PROJECTS_DIR, "/projects"), (EXPORTS_DIR, "/exports")):
+        ap = os.path.abspath(path)
+        if ap.startswith(os.path.abspath(root) + os.sep):
+            return prefix + "/" + quote(os.path.relpath(ap, root).replace(os.sep, "/"))
+    return path
 
 
 def open_path(path: str):
@@ -193,6 +209,10 @@ async def main(page: ft.Page):
                             max_lines=5, width=520)
         length = ft.Dropdown(label="글 길이", value=f.get("length", "보통"), width=200,
                              options=[ft.dropdown.Option(x) for x in bw.LENGTHS])
+        tpl = ft.Dropdown(label="글 서식 스타일", value=f.get("template") or settings().blog_template, width=250,
+                          options=[ft.dropdown.Option(k, f"{v['label']} — {v['desc'][:22]}…") for k, v in formatting.TEMPLATES.items()])
+        strength = ft.Dropdown(label="서식 강도", value=f.get("strength") or settings().blog_strength, width=200,
+                               options=[ft.dropdown.Option(k, formatting.STRENGTHS[k]["label"]) for k in formatting.STRENGTH_ORDER])
         thumbs = ft.Row(spacing=8, wrap=True)
         upload_msg = ft.Text("", size=12, color=MUTED)
 
@@ -200,7 +220,7 @@ async def main(page: ft.Page):
             thumbs.controls = []
             for a in S["assets"]:
                 thumbs.controls.append(ft.Stack([
-                    ft.Container(ft.Image(src=a.keyframes[0] if a.keyframes else a.path, width=96, height=96, fit=ft.BoxFit.COVER),
+                    ft.Container(ft.Image(src=img_src(a.keyframes[0] if a.keyframes else a.path), width=96, height=96, fit=ft.BoxFit.COVER),
                                  border_radius=8, tooltip=f"{a.id} · {a.original_name}"),
                     ft.Container(ft.Text(a.id, size=10, color="#FFFFFF"), bgcolor="#000000AA", padding=3, left=4, top=4, border_radius=4),
                     ft.IconButton(ft.Icons.CLOSE, icon_size=14, right=0, top=0, bgcolor="#FFFFFFCC",
@@ -244,13 +264,15 @@ async def main(page: ft.Page):
                 return
             S["form"] = {"brand_id": brand.value, "audience": "" if audience.value == TARGETS[0] else audience.value,
                          "product": (product.value or "").strip(), "news": (news.value or "").strip(),
-                         "memo": (memo.value or "").strip(), "length": length.value}
+                         "memo": (memo.value or "").strip(), "length": length.value,
+                         "template": tpl.value, "strength": strength.value}
             await make_blog()
 
         return [
             card(h("① 이번에 무엇을 알릴까요?"),
                  note("아래 세 가지만 적으면 블로그 글을 만들고, 같은 내용으로 카드뉴스와 쇼츠까지 이어서 만들 수 있어요."),
-                 brand, audience, product, news, memo, length),
+                 brand, audience, product, news, memo, ft.Row([length, tpl, strength], wrap=True),
+                 note("서식 스타일·강도는 네이버 글에 들어갈 소제목, 굵게, 형광, 인용구, 구분선, 요약 박스를 정합니다. (OSMU_cjc 서식 규칙)")),
             card(h("사진 올리기 (선택, 3~5장 권장)"),
                  note("올린 사진은 블로그와 카드뉴스에 쓰입니다. 원물 컷(투명창 파우치), 조리 후 컷, 가시 제거 순살 컷이 좋아요."),
                  ft.Row([ft.OutlinedButton("사진 고르기", icon=ft.Icons.ADD_PHOTO_ALTERNATE, on_click=pick), upload_msg]), thumbs),
@@ -263,7 +285,8 @@ async def main(page: ft.Page):
         p.title = (f.get("product") or f.get("news") or "새 콘텐츠")[:30]
         provider = settings().ai_provider
         req = bw.BlogRequest(brand_id=f["brand_id"], audience=f["audience"], product=f["product"], news=f["news"],
-                             memo=f["memo"], length=f["length"], provider=provider, assets=list(S["assets"]))
+                             memo=f["memo"], length=f["length"], template=f.get("template") or "basic",
+                             strength=f.get("strength") or "standard", provider=provider, assets=list(S["assets"]))
         set_busy(True, f"{'Claude' if provider == 'claude' else 'Gemini'}가 블로그 글을 쓰는 중입니다… (30초 정도)")
         try:
             S["draft"] = await bw.generate(req, keys())
@@ -287,9 +310,21 @@ async def main(page: ft.Page):
                          ft.Button("1단계로", on_click=lambda e: goto(0)))]
         kit = bk.load_kit(S["form"].get("brand_id") or settings().active_brand_id)
         title = ft.TextField(label="제목", value=d.title, text_size=16, width=820)
-        body = ft.TextField(label="본문 (직접 고쳐 쓸 수 있어요)", value=d.body, multiline=True, min_lines=18, max_lines=40, width=820)
+        body = ft.TextField(label="본문 (직접 고쳐 쓸 수 있어요)", value=d.body, multiline=True, min_lines=14, max_lines=18, width=820)
         tags = ft.TextField(label="해시태그", value=" ".join(d.hashtags), width=820)
         warn_box = ft.Column(spacing=4)
+        preview = ft.Container(visible=False, padding=16, bgcolor="#FAFBFC", border_radius=8, border=ft.Border.all(1, "#E2E8F0"), width=820)
+        photo_paths = {a.id: a.path for a in S["assets"]}
+
+        def toggle_preview(e):
+            sync()
+            if preview.visible:
+                preview.visible = False
+            else:
+                preview.content = ft.Markdown(bw.preview_markdown(d.body, photo_paths), selectable=True,
+                                              extension_set=ft.MarkdownExtensionSet.GITHUB_WEB)
+                preview.visible = True
+            preview.update()
 
         def sync():
             d.title, d.body = title.value or "", body.value or ""
@@ -315,9 +350,11 @@ async def main(page: ft.Page):
         legend = ", ".join(f"[사진:{a.id}]={a.original_name}" for a in S["assets"]) or "첨부한 사진이 없습니다."
         return [
             card(h("② 블로그 글"), *[ft.Text("• " + n, size=12, color="#B45309") for n in d.notes], title, body, tags,
-                 note(f"## 로 시작하는 줄은 소제목이에요. 사진 위치는 [사진:A1] 줄로 표시됩니다 — 줄을 옮기면 사진 위치가 바뀌어요.  ({legend})"),
-                 ft.Row([ft.OutlinedButton("표현 점검", icon=ft.Icons.FACT_CHECK, on_click=check),
-                         ft.OutlinedButton("다시 만들기", icon=ft.Icons.REFRESH, on_click=regen)]), warn_box),
+                 note("서식 표시: ## 소제목 · **굵게** · ==형광== · > 인용구 · --- 구분선 · [요약 박스]…[/요약 박스]. 이 표시는 네이버에 붙일 때 실제 서식으로 바뀌어요."),
+                 note(f"사진 위치는 [사진:A1] 줄로 표시됩니다 — 줄을 옮기면 사진 위치가 바뀌어요.  ({legend})"),
+                 ft.Row([ft.OutlinedButton("서식 미리보기", icon=ft.Icons.VISIBILITY, on_click=toggle_preview),
+                         ft.OutlinedButton("표현 점검", icon=ft.Icons.FACT_CHECK, on_click=check),
+                         ft.OutlinedButton("다시 만들기", icon=ft.Icons.REFRESH, on_click=regen)]), warn_box, preview),
             nav_row(back=0, nxt=to_cards, nxt_label="카드뉴스 만들기",
                     extra=[ft.TextButton("카드뉴스 없이 게시로", on_click=lambda e: (sync(), goto(4)))]),
         ]
@@ -338,7 +375,7 @@ async def main(page: ft.Page):
         thumbs = ft.Row(spacing=10, wrap=True)
 
         def draw():
-            thumbs.controls = [ft.Container(ft.Image(src=pth, width=230, fit=ft.BoxFit.CONTAIN), border_radius=8,
+            thumbs.controls = [ft.Container(ft.Image(src=img_src(pth), width=230, fit=ft.BoxFit.CONTAIN), border_radius=8,
                                             border=ft.Border.all(1, "#CBD5E1")) for pth in S["cards"]]
             try:
                 thumbs.update()
@@ -519,7 +556,9 @@ async def main(page: ft.Page):
             kit = bk.load_kit(S["form"].get("brand_id") or s.active_brand_id)
             body = bw.arrange_images(d.body, S["image_mode"], [a.id for a in S["assets"]], len(S["cards"]))
             photos = {a.id: a.path for a in S["assets"]}
-            segs = bw.to_segments(d.title, body, d.hashtags, photos, S["cards"])
+            mode = s.naver_format_mode
+            segs, expected = bw.to_segments(d.title, body, d.hashtags, photos, S["cards"],
+                                            S["form"].get("template") or "basic", S["form"].get("strength") or "standard", mode)
             ws = bw.review(f"{d.title}\n{d.body}", kit)
             if ws:
                 on_status("참고: 주의 표현이 있어요 — " + " / ".join(w.split(" — ")[0] for w in ws[:3]) + " (2단계의 [표현 점검]에서 확인)")
@@ -529,7 +568,7 @@ async def main(page: ft.Page):
 
             def work():
                 try:
-                    naver_publish.publish(bid, d.title, segs, on_status)
+                    naver_publish.publish(bid, d.title, segs, on_status, expected, mode)
                 finally:
                     S["naver_running"] = False
             threading.Thread(target=work, daemon=True).start()
@@ -636,7 +675,15 @@ async def main(page: ft.Page):
 
 
 def create_web_app():
-    return ft.run(main, export_asgi_app=True, assets_dir=ASSETS_DIR, upload_dir=UPLOAD_DIR)
+    """웹(localhost) 모드: 카드·사진 이미지를 브라우저가 볼 수 있게 /projects, /exports 로 내준다"""
+    from starlette.routing import Mount
+    from starlette.staticfiles import StaticFiles
+    app = ft.run(main, export_asgi_app=True, assets_dir=ASSETS_DIR, upload_dir=UPLOAD_DIR)
+    os.makedirs(ps.PROJECTS_DIR, exist_ok=True)
+    os.makedirs(EXPORTS_DIR, exist_ok=True)
+    app.router.routes.insert(0, Mount("/exports", app=StaticFiles(directory=EXPORTS_DIR), name="exports"))
+    app.router.routes.insert(0, Mount("/projects", app=StaticFiles(directory=ps.PROJECTS_DIR), name="projects"))
+    return app
 
 
 if __name__ == "__main__":

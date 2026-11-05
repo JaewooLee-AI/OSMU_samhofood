@@ -5,6 +5,7 @@ import flet as ft
 from services import brand_kit as bk
 from services import key_store
 from services import usage_log
+from services import formatting
 from services.ai_director import CLAUDE_MODEL
 
 NAVY = "#0F3A68"
@@ -42,6 +43,9 @@ class SettingsView:
         self.key_status = ft.Text("", size=12)
         self.blog_id = ft.TextField(label="네이버 블로그 아이디", value=s.naver_blog_id, width=320,
                                     hint_text="blog.naver.com/ 뒤에 오는 아이디")
+        self.paste_mode = ft.Dropdown(
+            label="네이버 서식 붙여넣기 방식", value=s.naver_format_mode, width=320,
+            options=[ft.dropdown.Option(k, v) for k, v in formatting.NAVER_FORMAT_MODES.items()])
         self.ai_images = ft.Switch(label="사진이 없는 카드는 AI 이미지로 채우기 (Gemini 키 필요, 이미지마다 비용 발생)",
                                    value=s.generate_ai_images)
         self.control = ft.Column([
@@ -53,7 +57,9 @@ class SettingsView:
                          ft.TextButton("저장된 키 지우기", on_click=self.clear_keys)]),
                  self.key_status,
                  note("키는 이 PC의 사용자 폴더(~/.osmu_media_studio)에만 저장되고 화면·로그에 표시되지 않습니다. 사용한 만큼 각 회사에 요금이 청구되며, '비용' 화면에서 확인할 수 있습니다.")),
-            card(h("③ 네이버 블로그"), self.blog_id, self.ai_images,
+            card(h("③ 네이버 블로그"), self.blog_id, self.paste_mode,
+                 note("‘에디터 서식 우선’은 인용구·구분선·요약 박스를 네이버 에디터 서식으로 바꿔 붙이고, 잘 안 바뀌면 ‘기호로 대체’(❝ ❞ ────)를 고르세요."),
+                 self.ai_images,
                  ft.Button("설정 저장", icon=ft.Icons.SAVE, on_click=self.save_settings)),
         ], spacing=16, scroll=ft.ScrollMode.AUTO, expand=True)
 
@@ -96,6 +102,7 @@ class SettingsView:
         s = bk.load_settings()
         s.ai_provider = self.provider.value or "gemini"
         s.naver_blog_id = (self.blog_id.value or "").strip().replace("https://blog.naver.com/", "").strip("/")
+        s.naver_format_mode = self.paste_mode.value or "editor"
         s.generate_ai_images = bool(self.ai_images.value)
         bk.save_settings(s)
         self.toast("설정을 저장했습니다.")
